@@ -21,9 +21,13 @@ import json
 import logging
 import threading
 import time
+import re
+import unicodedata
+import socket
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 import requests
+import dns.resolver
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -60,9 +64,75 @@ HEYREACH_HEADERS = {
 
 HANNA_ACCOUNT_ID = 140072
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))  # seconds, default 10 min
+EMAIL_ENRICHMENT_INTERVAL = int(os.environ.get("EMAIL_ENRICHMENT_INTERVAL", "1800"))  # default 30 min
+ZEROBOUNCE_API_KEY = os.environ.get("ZEROBOUNCE_API_KEY", "")
 
 # Track sync state for health endpoint
 last_sync = {"time": None, "status": None, "updated": 0, "total": 0}
+last_email_enrichment = {"time": None, "status": None, "found": 0, "processed": 0}
+
+# Researched company → domain mapping (verified correct domains)
+DOMAIN_MAP = {
+    "Göteborg Energi": "goteborgenergi.se",
+    "GÖTEBORG ENERGI NÄT AB": "goteborgenergi.se",
+    "Göteborg Energi Nät AB": "goteborgenergi.se",
+    "Göteborg Energi AB": "goteborgenergi.se",
+    "Göteborg Energi Elnät": "goteborgenergi.se",
+    "Göteborgenergi AB": "goteborgenergi.se",
+    "Goteborg Energi": "goteborgenergi.se",
+    "Jämtkraft AB": "jamtkraft.se",
+    "Jönköping Energi": "jonkopingenergi.se",
+    "Jönköping Energi AB": "jonkopingenergi.se",
+    "Jönköping Energi Nät AB": "jonkopingenergi.se",
+    "Gävle Energi AB": "gavleenergi.se",
+    "Mälarenergi": "malarenergi.se",
+    "Mälarenergi AB": "malarenergi.se",
+    "Mälarenergi Elnät AB": "malarenergi.se",
+    "Mälarenergi Vatten AB": "malarenergi.se",
+    "MÄLARENERGI ELNÄT AB": "malarenergi.se",
+    "Karlstads Energi AB": "karlstadsenergi.se",
+    "Affärsverken Karlskrona AB": "affarsverken.se",
+    "Affärsverken AB": "affarsverken.se",
+    "Eskilstuna Strängnäs Energi och Miljö AB": "esem.se",
+    "Skellefteå Kraft": "skekraft.se",
+    "Skellefteå Kraft AB": "skekraft.se",
+    "SKELLEFTEÅ KRAFT ELNÄT AB": "skekraft.se",
+    "Borås Energi och Miljö AB": "borasem.se",
+    "Uddevalla Energi AB": "uddevallaenergi.se",
+    "Alingsås Energi": "alingsasenergi.se",
+    "Dala Energi AB": "dalaenergi.se",
+    "Halmstads Energi och Miljö AB": "hem.se",
+    "HALMSTADS ENERGI OCH MILJÖ NÄT AB": "hem.se",
+    "Luleå Energi": "luleaenergi.se",
+    "Umeå Energi AB": "umeaenergi.se",
+    "Umeå Energi Elnät AB": "umeaenergi.se",
+    "Energi & Driftteknik i Sundsvall AB": "ed-teknik.se",
+    "ENERGI & DRIFTTEKNIK I SUNDSVALL AB": "ed-teknik.se",
+    "Tekniska verken i Linköping AB": "tekniskaverken.se",
+    "Tekniska verken i Linkoping AB": "tekniskaverken.se",
+    "Kraftringen": "kraftringen.se",
+    "Kraftringen Elförsäljning AB": "kraftringen.se",
+    "Sundsvall Energi": "sundsvallenergi.se",
+    "Trollhättan Energi AB": "trollhattanenergi.se",
+    "Region Kalmar län": "regionkalmar.se",
+    "Region Jönköpings län": "rjl.se",
+    "Region Jämtland Härjedalen": "regionjh.se",
+    "Östersunds kommun": "ostersund.se",
+    "Arvika Fjärrvärme AB, Arvika Kraft AB": "teknikivast.se",
+    "ONE Nordic ES AB": "one-nordic.se",
+    "KALMAR ENERGI VÄRME AB": "kalmarenergi.se",
+    "Skånska Energi": "skanska-energi.se",
+    "Eksjö Energi Elit AB": "eksjoenergi.se",
+    "Varberg Energi": "varbergenergi.se",
+    "Härnösand Energi & Miljö AB, HEMAB": "hemab.se",
+}
+
+EMAIL_PATTERNS = [
+    "{first}.{last}@{domain}",
+    "{f}{last}@{domain}",
+    "{first}{last}@{domain}",
+    "{f}.{last}@{domain}",
+]
 
 # --- Attio helpers ---
 
@@ -480,21 +550,362 @@ def sync_loop():
         time.sleep(SYNC_INTERVAL)
 
 
-# Update health endpoint to include sync status
+# --- Background email enrichment ---
+
+def transliterate_swedish(name):
+    """Convert Swedish characters to ASCII for email guessing."""
+    replacements = {'å': 'a', 'ä': 'a', 'ö': 'o', 'Å': 'A', 'Ä': 'A', 'Ö': 'O',
+                    'é': 'e', 'è': 'e', 'ë': 'e', 'ü': 'u', 'ñ': 'n'}
+    result = name
+    for orig, repl in replacements.items():
+        result = result.replace(orig, repl)
+    result = unicodedata.normalize('NFD', result)
+    result = ''.join(c for c in result if unicodedata.category(c) != 'Mn')
+    return result
+
+
+def domain_has_mx(domain):
+    """Check if a domain has valid MX records."""
+    try:
+        answers = dns.resolver.resolve(domain, 'MX')
+        return len(answers) > 0
+    except Exception:
+        return False
+
+
+def guess_domain(company_name):
+    """Guess company domain from name as last resort."""
+    clean = company_name.lower().strip()
+    clean = re.sub(r'\s*(ab|group|holding|sweden|sverige|nät|elnät|energi\s+nät)\s*$', '', clean, flags=re.IGNORECASE).strip()
+    clean = re.sub(r'[^a-zåäö0-9\s]', '', clean)
+    clean = transliterate_swedish(clean)
+    clean = re.sub(r'\s+', '', clean)
+    return f"{clean}.se"
+
+
+def resolve_company_domain(company_name):
+    """Get verified domain for a company. Returns domain or None."""
+    if not company_name:
+        return None
+
+    # 1. Check researched domain map (exact match)
+    domain = DOMAIN_MAP.get(company_name.strip())
+    if domain and domain_has_mx(domain):
+        return domain
+
+    # 2. Check map with case variations
+    for key, val in DOMAIN_MAP.items():
+        if key.lower().strip() == company_name.lower().strip():
+            if domain_has_mx(val):
+                return val
+
+    # 3. Try to get domain from Attio company record
+    # (handled in the enrichment loop where we have company_rid)
+
+    # 4. Guess domain and verify MX
+    guessed = guess_domain(company_name)
+    if domain_has_mx(guessed):
+        return guessed
+
+    return None
+
+
+def generate_email_candidates(first_name, last_name, domain):
+    """Generate email candidate patterns."""
+    first = transliterate_swedish(first_name).lower().strip()
+    last = transliterate_swedish(last_name).lower().strip()
+    f = first[0] if first else ""
+    candidates = []
+    seen = set()
+    for pattern in EMAIL_PATTERNS:
+        try:
+            email = pattern.format(first=first, last=last, f=f, domain=domain)
+            if email not in seen:
+                seen.add(email)
+                candidates.append(email)
+        except (KeyError, IndexError):
+            continue
+    return candidates
+
+
+def zerobounce_verify(email):
+    """Verify a single email via ZeroBounce. Returns (status, is_deliverable)."""
+    if not ZEROBOUNCE_API_KEY:
+        return "unknown", False
+
+    try:
+        resp = requests.get("https://api.zerobounce.net/v2/validate", params={
+            "api_key": ZEROBOUNCE_API_KEY,
+            "email": email,
+            "ip_address": "",
+        }, timeout=15)
+        data = resp.json()
+
+        zb_status = data.get("status", "unknown").lower()
+        status_map = {
+            "valid": "valid",
+            "invalid": "invalid",
+            "catch-all": "catch-all",
+            "unknown": "unknown",
+            "spamtrap": "invalid",
+            "abuse": "invalid",
+            "do_not_mail": "invalid",
+        }
+        normalized = status_map.get(zb_status, "unknown")
+        return normalized, normalized == "valid"
+    except Exception as e:
+        logger.error(f"ZeroBounce error for {email}: {e}")
+        return "unknown", False
+
+
+def pick_best_email(candidates):
+    """Verify candidates and return best email. Returns (email, confidence) or (None, None)."""
+    for i, email in enumerate(candidates):
+        if i > 0:
+            time.sleep(0.5)
+        status, is_valid = zerobounce_verify(email)
+
+        if status == "valid":
+            return email, "high"
+        elif status == "catch-all":
+            # Catch-all: first candidate (most specific) is best
+            return email, "medium"
+
+    return None, None
+
+
+def get_heyreach_company_for_lead(linkedin_slug, conversations_cache):
+    """Get current company from HeyReach conversation data (LinkedIn = source of truth)."""
+    for convo in conversations_cache:
+        profile = convo.get("correspondentProfile", {})
+        url = profile.get("profileUrl", "")
+        if linkedin_slug and linkedin_slug in url.lower():
+            return profile.get("companyName", "")
+    return None
+
+
+def fetch_all_pipeline_entries():
+    """Fetch all ATLAS pipeline entries."""
+    entries = []
+    offset = 0
+    while True:
+        resp = requests.post(
+            f"https://api.attio.com/v2/lists/{LIST_ID}/entries/query",
+            headers=ATTIO_HEADERS,
+            json={"limit": 50, "offset": offset},
+        )
+        resp.raise_for_status()
+        batch = resp.json().get("data", [])
+        entries.extend(batch)
+        if len(batch) < 50:
+            break
+        offset += 50
+        time.sleep(0.1)
+    return entries
+
+
+def run_email_enrichment(conversations_cache):
+    """Single enrichment cycle: find leads without email, verify company, find email."""
+    if not ZEROBOUNCE_API_KEY:
+        logger.info("Email enrichment skipped — ZEROBOUNCE_API_KEY not set")
+        return
+
+    logger.info("Email enrichment starting...")
+
+    # Get all pipeline entries
+    entries = fetch_all_pipeline_entries()
+
+    # Filter to entries without email AND not already searched
+    to_enrich = []
+    for entry in entries:
+        ev = entry.get("entry_values", {})
+        has_email = ev.get("has_email", [])
+        already_has = has_email and has_email[0].get("value") is True
+        searched = ev.get("email_searched", [])
+        already_searched = searched and searched[0].get("value") is True
+        if not already_has and not already_searched:
+            to_enrich.append(entry)
+
+    logger.info(f"Email enrichment: {len(to_enrich)} leads need email (out of {len(entries)} total)")
+
+    if not to_enrich:
+        last_email_enrichment["time"] = datetime.now(timezone.utc).isoformat()
+        last_email_enrichment["status"] = "ok"
+        last_email_enrichment["found"] = 0
+        last_email_enrichment["processed"] = 0
+        return
+
+    # Process up to 10 per cycle to conserve ZeroBounce credits
+    batch = to_enrich[:10]
+    found = 0
+
+    for entry in batch:
+        record_id = entry.get("parent_record_id", "")
+        entry_id = entry.get("id", {}).get("entry_id", "")
+
+        # Fetch person from Attio
+        try:
+            resp = requests.get(
+                f"https://api.attio.com/v2/objects/people/records/{record_id}",
+                headers=ATTIO_HEADERS,
+            )
+            resp.raise_for_status()
+            person = resp.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch person {record_id}: {e}")
+            continue
+
+        values = person.get("data", {}).get("values", {})
+        name_val = values.get("name", [])
+        first_name = name_val[0].get("first_name", "") if name_val else ""
+        last_name = name_val[0].get("last_name", "") if name_val else ""
+        linkedin_vals = values.get("linkedin", [])
+        linkedin_url = linkedin_vals[0].get("value", "") if linkedin_vals else ""
+        linkedin_slug = linkedin_url.lower().split("/in/")[-1].rstrip("/") if "/in/" in linkedin_url else ""
+
+        if not first_name or not last_name:
+            continue
+
+        # Step 1: Get CURRENT company from HeyReach (LinkedIn = truth)
+        heyreach_company = get_heyreach_company_for_lead(linkedin_slug, conversations_cache)
+
+        # Fallback: get company from Attio
+        attio_company = ""
+        company_vals = values.get("company", [])
+        if company_vals:
+            company_rid = company_vals[0].get("target_record_id", "")
+            if company_rid:
+                try:
+                    cresp = requests.get(
+                        f"https://api.attio.com/v2/objects/companies/records/{company_rid}",
+                        headers=ATTIO_HEADERS,
+                    )
+                    cresp.raise_for_status()
+                    cvals = cresp.json().get("data", {}).get("values", {})
+                    cname = cvals.get("name", [])
+                    attio_company = cname[0].get("value", "") if cname else ""
+                    # Also check if company has a domain in Attio
+                    domains = cvals.get("domains", [])
+                    if domains:
+                        attio_domain = domains[0].get("domain", "")
+                        if attio_domain and domain_has_mx(attio_domain):
+                            # Attio has a verified domain already
+                            pass
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+        # Use HeyReach company (current employer) over Attio
+        company = heyreach_company or attio_company
+        if not company:
+            logger.info(f"[EMAIL] {first_name} {last_name} — no company found, marking searched")
+            try:
+                requests.patch(
+                    f"https://api.attio.com/v2/lists/{LIST_ID}/entries/{entry_id}",
+                    headers=ATTIO_HEADERS,
+                    json={"data": {"entry_values": {"email_searched": [{"value": True}]}}},
+                )
+            except Exception:
+                pass
+            continue
+
+        # Step 2: Resolve and verify domain
+        domain = resolve_company_domain(company)
+        if not domain:
+            logger.info(f"[EMAIL] {first_name} {last_name} @ {company} — no valid domain found, marking searched")
+            try:
+                requests.patch(
+                    f"https://api.attio.com/v2/lists/{LIST_ID}/entries/{entry_id}",
+                    headers=ATTIO_HEADERS,
+                    json={"data": {"entry_values": {"email_searched": [{"value": True}]}}},
+                )
+            except Exception:
+                pass
+            continue
+
+        # Step 3: Generate candidates and verify with ZeroBounce
+        candidates = generate_email_candidates(first_name, last_name, domain)
+        logger.info(f"[EMAIL] {first_name} {last_name} @ {company} → {domain} ({len(candidates)} candidates)")
+
+        best_email, confidence = pick_best_email(candidates)
+
+        if best_email:
+            logger.info(f"[EMAIL] {first_name} {last_name} → FOUND {best_email} ({confidence})")
+            found += 1
+            try:
+                # Add email to person
+                requests.patch(
+                    f"https://api.attio.com/v2/objects/people/records/{record_id}",
+                    headers=ATTIO_HEADERS,
+                    json={"data": {"values": {"email_addresses": [{"email_address": best_email}]}}},
+                )
+                # Update pipeline entry
+                requests.patch(
+                    f"https://api.attio.com/v2/lists/{LIST_ID}/entries/{entry_id}",
+                    headers=ATTIO_HEADERS,
+                    json={"data": {"entry_values": {
+                        "has_email": [{"value": True}],
+                        "email_searched": [{"value": True}],
+                    }}},
+                )
+            except Exception as e:
+                logger.error(f"[EMAIL] Failed to update Attio for {first_name} {last_name}: {e}")
+        else:
+            logger.info(f"[EMAIL] {first_name} {last_name} @ {company} → no valid email found")
+            try:
+                requests.patch(
+                    f"https://api.attio.com/v2/lists/{LIST_ID}/entries/{entry_id}",
+                    headers=ATTIO_HEADERS,
+                    json={"data": {"entry_values": {"email_searched": [{"value": True}]}}},
+                )
+            except Exception:
+                pass
+
+        time.sleep(0.3)
+
+    last_email_enrichment["time"] = datetime.now(timezone.utc).isoformat()
+    last_email_enrichment["status"] = "ok"
+    last_email_enrichment["found"] = found
+    last_email_enrichment["processed"] = len(batch)
+    logger.info(f"Email enrichment done: {found} found out of {len(batch)} processed")
+
+
+def email_enrichment_loop():
+    """Background loop for email enrichment."""
+    # Wait for first conversation sync to populate cache
+    time.sleep(60)
+    logger.info(f"Background email enrichment started (interval: {EMAIL_ENRICHMENT_INTERVAL}s)")
+
+    while True:
+        try:
+            # Fetch fresh conversations to get current company data
+            conversations = fetch_all_conversations()
+            run_email_enrichment(conversations)
+        except Exception as e:
+            logger.error(f"Email enrichment failed: {e}")
+            last_email_enrichment["time"] = datetime.now(timezone.utc).isoformat()
+            last_email_enrichment["status"] = f"error: {e}"
+        time.sleep(EMAIL_ENRICHMENT_INTERVAL)
+
+
+# Health endpoint with both sync statuses
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({
         "status": "ok",
         "last_sync": last_sync,
+        "last_email_enrichment": last_email_enrichment,
     })
 
 
-# Start background sync thread (works with both gunicorn and direct run)
+# Start background threads (works with both gunicorn and direct run)
 _sync_started = False
 if not _sync_started:
     _sync_started = True
     sync_thread = threading.Thread(target=sync_loop, daemon=True)
     sync_thread.start()
+    email_thread = threading.Thread(target=email_enrichment_loop, daemon=True)
+    email_thread.start()
 
 
 if __name__ == "__main__":
