@@ -4,17 +4,24 @@ HeyReach → Attio Webhook Bridge
 Deployed on Railway. Receives HeyReach webhook events and updates
 Attio CRM pipeline stages accordingly.
 
+Background conversation sync runs every 10 minutes, polling HeyReach
+conversations API to catch replies and status changes that webhooks miss
+(manual Unibox messages, leads not in Attio when webhook fired, downtime).
+
 Endpoints:
   POST /webhook/reply         — HeyReach MESSAGE_REPLY_RECEIVED
   POST /webhook/connection    — HeyReach CONNECTION_REQUEST_ACCEPTED
   POST /webhook/message-sent  — HeyReach MESSAGE_SENT
   POST /sync                  — Pull all HeyReach conversations and sync to Attio
-  GET  /health                — Health check
+  GET  /health                — Health check (includes last sync status)
 """
 
 import os
 import json
 import logging
+import threading
+import time
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 import requests
 
@@ -50,6 +57,12 @@ HEYREACH_HEADERS = {
     "X-API-KEY": HEYREACH_API_KEY,
     "Content-Type": "application/json",
 }
+
+HANNA_ACCOUNT_ID = 140072
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))  # seconds, default 10 min
+
+# Track sync state for health endpoint
+last_sync = {"time": None, "status": None, "updated": 0, "total": 0}
 
 # --- Attio helpers ---
 
@@ -228,9 +241,7 @@ def process_lead(first_name, last_name, linkedin_url, target_stage, event_type, 
 
 # --- Webhook endpoints ---
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+# /health endpoint is defined below, after sync logic
 
 
 @app.route("/webhook/reply", methods=["POST"])
@@ -326,6 +337,164 @@ def sync_conversations():
 
     logger.info(f"Sync complete: {results['updated']} updated, {results['skipped']} skipped, {results['not_found']} not found")
     return jsonify(results)
+
+
+# --- Background conversation sync ---
+
+def fetch_all_conversations():
+    """Paginate through all HeyReach conversations for Hanna's account."""
+    all_convos = []
+    offset = 0
+    limit = 100
+
+    while True:
+        resp = requests.post(
+            "https://api.heyreach.io/api/public/inbox/get-conversations-v2",
+            headers=HEYREACH_HEADERS,
+            json={
+                "linkedInAccountIds": [HANNA_ACCOUNT_ID],
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        total = data.get("totalCount", 0)
+        all_convos.extend(items)
+
+        if len(all_convos) >= total or len(items) < limit:
+            break
+        offset += limit
+        time.sleep(0.3)
+
+    return all_convos
+
+
+# Track which replies we've already noted (by conversation ID) to avoid duplicate notes
+_noted_replies = set()
+
+
+def run_conversation_sync():
+    """Single sync cycle: fetch conversations, update Attio stages."""
+    logger.info("Conversation sync starting...")
+    conversations = fetch_all_conversations()
+    logger.info(f"Fetched {len(conversations)} conversations")
+
+    updated = 0
+    skipped = 0
+    not_found = 0
+
+    for convo in conversations:
+        profile = convo.get("correspondentProfile", {})
+        first_name = profile.get("firstName", "")
+        last_name = profile.get("lastName", "")
+        profile_url = profile.get("profileUrl", "")
+        last_sender = convo.get("lastMessageSender", "")
+        last_text = convo.get("lastMessageText", "")
+        convo_id = convo.get("id", "")
+
+        # Determine target stage
+        if last_sender == "CORRESPONDENT":
+            target_stage = STAGES["replied"]
+            event_type = "SYNC"
+            # Only attach reply text as note if we haven't already
+            message_text = last_text if convo_id not in _noted_replies else None
+        else:
+            target_stage = STAGES["in_sequence"]
+            event_type = "SYNC"
+            message_text = None
+
+        # Find in Attio
+        record_id = None
+        if profile_url:
+            try:
+                record_id = attio_find_person_by_linkedin(profile_url)
+            except Exception:
+                pass
+        if not record_id and first_name and last_name:
+            try:
+                record_id = attio_find_person(first_name, last_name)
+            except Exception:
+                pass
+
+        if not record_id:
+            not_found += 1
+            continue
+
+        # Get pipeline entry
+        try:
+            entry_id, current_stage = attio_get_pipeline_entry(record_id)
+        except Exception:
+            not_found += 1
+            continue
+
+        if not entry_id:
+            not_found += 1
+            continue
+
+        if not should_advance(current_stage, target_stage):
+            skipped += 1
+            continue
+
+        # Create note for new replies
+        if last_sender == "CORRESPONDENT" and convo_id not in _noted_replies and last_text:
+            name = f"{first_name} {last_name}".strip()
+            try:
+                attio_create_note(record_id, f"LinkedIn reply from {name}", last_text)
+                _noted_replies.add(convo_id)
+            except Exception as e:
+                logger.error(f"Failed to create reply note for {name}: {e}")
+
+        # Update stage
+        try:
+            attio_update_stage(entry_id, target_stage)
+            target_name = next((k for k, v in STAGES.items() if v == target_stage), "?")
+            logger.info(f"[SYNC] {first_name} {last_name} → {target_name}")
+            updated += 1
+        except Exception as e:
+            logger.error(f"[SYNC] Failed to update {first_name} {last_name}: {e}")
+
+        time.sleep(0.1)  # rate limit
+
+    last_sync["time"] = datetime.now(timezone.utc).isoformat()
+    last_sync["status"] = "ok"
+    last_sync["updated"] = updated
+    last_sync["total"] = len(conversations)
+    logger.info(f"Conversation sync done: {updated} updated, {skipped} skipped, {not_found} not found out of {len(conversations)}")
+
+
+def sync_loop():
+    """Background loop that runs conversation sync on an interval."""
+    # Wait for Flask to start up
+    time.sleep(10)
+    logger.info(f"Background conversation sync started (interval: {SYNC_INTERVAL}s)")
+
+    while True:
+        try:
+            run_conversation_sync()
+        except Exception as e:
+            logger.error(f"Conversation sync failed: {e}")
+            last_sync["time"] = datetime.now(timezone.utc).isoformat()
+            last_sync["status"] = f"error: {e}"
+        time.sleep(SYNC_INTERVAL)
+
+
+# Update health endpoint to include sync status
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "last_sync": last_sync,
+    })
+
+
+# Start background sync thread (works with both gunicorn and direct run)
+_sync_started = False
+if not _sync_started:
+    _sync_started = True
+    sync_thread = threading.Thread(target=sync_loop, daemon=True)
+    sync_thread.start()
 
 
 if __name__ == "__main__":
