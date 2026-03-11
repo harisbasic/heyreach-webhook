@@ -139,6 +139,30 @@ def attio_update_stage(entry_id, stage_id):
     return resp.json()
 
 
+def attio_create_note(record_id, title, body):
+    """Create a note on a person's record in Attio."""
+    try:
+        resp = requests.post(
+            "https://api.attio.com/v2/notes",
+            headers=ATTIO_HEADERS,
+            json={
+                "data": {
+                    "title": title,
+                    "format": "plaintext",
+                    "content": body,
+                    "parent_object": "people",
+                    "parent_record_id": record_id,
+                }
+            },
+        )
+        resp.raise_for_status()
+        logger.info(f"Note created on {record_id}: {title}")
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Failed to create note on {record_id}: {e}")
+        return None
+
+
 # Stage progression order — only move forward, never backward
 STAGE_ORDER = [
     STAGES["new_lead"],
@@ -164,8 +188,8 @@ def should_advance(current_stage_id, target_stage_id):
         return True
 
 
-def process_lead(first_name, last_name, linkedin_url, target_stage, event_type):
-    """Core logic: find lead in Attio and update their pipeline stage."""
+def process_lead(first_name, last_name, linkedin_url, target_stage, event_type, message_text=None):
+    """Core logic: find lead in Attio, update pipeline stage, and log activity."""
     # Try LinkedIn URL first, then name
     record_id = None
     if linkedin_url:
@@ -178,6 +202,15 @@ def process_lead(first_name, last_name, linkedin_url, target_stage, event_type):
         logger.warning(f"[{event_type}] Lead not found in Attio: {first_name} {last_name} ({linkedin_url})")
         return {"status": "not_found", "name": f"{first_name} {last_name}"}
 
+    # Always log activity as a note (even if stage doesn't advance)
+    name = f"{first_name} {last_name}".strip()
+    if event_type in ("REPLY", "SYNC") and message_text:
+        attio_create_note(record_id, f"LinkedIn reply from {name}", message_text)
+    elif event_type == "CONNECTION":
+        attio_create_note(record_id, f"LinkedIn connection accepted", f"{name} accepted connection request on LinkedIn.")
+    elif event_type == "MESSAGE_SENT":
+        attio_create_note(record_id, f"LinkedIn message sent to {name}", message_text or "Outreach message sent via HeyReach.")
+
     entry_id, current_stage = attio_get_pipeline_entry(record_id)
 
     if not entry_id:
@@ -185,12 +218,12 @@ def process_lead(first_name, last_name, linkedin_url, target_stage, event_type):
         return {"status": "not_in_pipeline", "name": f"{first_name} {last_name}"}
 
     if not should_advance(current_stage, target_stage):
-        logger.info(f"[{event_type}] {first_name} {last_name} already at stage {current_stage}, skipping")
-        return {"status": "already_at_or_past_stage", "name": f"{first_name} {last_name}"}
+        logger.info(f"[{event_type}] {first_name} {last_name} already at stage {current_stage}, skipping stage update")
+        return {"status": "already_at_or_past_stage", "name": f"{first_name} {last_name}", "note_logged": True}
 
     attio_update_stage(entry_id, target_stage)
     logger.info(f"[{event_type}] {first_name} {last_name} → stage updated")
-    return {"status": "updated", "name": f"{first_name} {last_name}"}
+    return {"status": "updated", "name": f"{first_name} {last_name}", "note_logged": True}
 
 
 # --- Webhook endpoints ---
@@ -209,8 +242,9 @@ def webhook_reply():
     first_name = data.get("firstName", "")
     last_name = data.get("lastName", "")
     linkedin_url = data.get("profileUrl", "")
+    message_text = data.get("messageText", data.get("message", ""))
 
-    result = process_lead(first_name, last_name, linkedin_url, STAGES["replied"], "REPLY")
+    result = process_lead(first_name, last_name, linkedin_url, STAGES["replied"], "REPLY", message_text=message_text)
     return jsonify(result)
 
 
@@ -239,7 +273,8 @@ def webhook_message_sent():
     last_name = data.get("lastName", "")
     linkedin_url = data.get("profileUrl", "")
 
-    result = process_lead(first_name, last_name, linkedin_url, STAGES["in_sequence"], "MESSAGE_SENT")
+    message_text = data.get("messageText", data.get("message", ""))
+    result = process_lead(first_name, last_name, linkedin_url, STAGES["in_sequence"], "MESSAGE_SENT", message_text=message_text)
     return jsonify(result)
 
 
