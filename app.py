@@ -256,22 +256,26 @@ def sync_conversations():
     all_convos = []
     offset = 0
     while True:
-        resp = requests.get(
-            "https://api.heyreach.io/api/public/v2/conversations",
-            headers=HEYREACH_HEADERS,
-            params={
-                "campaignIds": campaign_id,
-                "limit": 100,
-                "offset": offset,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-        all_convos.extend(items)
-        if len(items) < 100:
-            break
-        offset += 100
+        try:
+            resp = requests.post(
+                "https://api.heyreach.io/api/public/v2/conversations",
+                headers=HEYREACH_HEADERS,
+                json={
+                    "campaignIds": [campaign_id],
+                    "limit": 100,
+                    "offset": offset,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", [])
+            all_convos.extend(items)
+            if len(items) < 100:
+                break
+            offset += 100
+        except Exception as e:
+            logger.error(f"HeyReach API error: {e}")
+            return jsonify({"error": str(e)}), 500
 
     logger.info(f"Fetched {len(all_convos)} conversations from HeyReach")
 
