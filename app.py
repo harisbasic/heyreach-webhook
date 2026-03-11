@@ -247,64 +247,44 @@ def webhook_message_sent():
 
 @app.route("/sync", methods=["POST"])
 def sync_conversations():
-    """Pull all HeyReach conversations for the ATLAS campaign and sync replies to Attio."""
-    campaign_id = request.json.get("campaign_id", 348585) if request.json else 348585
+    """Manual sync: accepts a list of leads with replies and updates Attio.
 
-    logger.info(f"Starting sync for campaign {campaign_id}")
+    POST body:
+    {
+        "leads": [
+            {"firstName": "Magnus", "lastName": "Olsson", "profileUrl": "https://...", "stage": "replied"},
+            ...
+        ]
+    }
 
-    # Fetch all conversations from HeyReach
-    all_convos = []
-    offset = 0
-    while True:
-        try:
-            resp = requests.post(
-                "https://api.heyreach.io/api/public/v2/conversations",
-                headers=HEYREACH_HEADERS,
-                json={
-                    "campaignIds": [campaign_id],
-                    "limit": 100,
-                    "offset": offset,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", [])
-            all_convos.extend(items)
-            if len(items) < 100:
-                break
-            offset += 100
-        except Exception as e:
-            logger.error(f"HeyReach API error: {e}")
-            return jsonify({"error": str(e)}), 500
+    Stage values: "replied", "in_sequence", "meeting_booked"
+    """
+    data = request.json or {}
+    leads = data.get("leads", [])
 
-    logger.info(f"Fetched {len(all_convos)} conversations from HeyReach")
+    if not leads:
+        return jsonify({"error": "No leads provided. Send {\"leads\": [{\"firstName\": ..., \"lastName\": ..., \"profileUrl\": ..., \"stage\": \"replied\"}]}"}), 400
 
-    results = {"total": len(all_convos), "replies_found": 0, "updated": 0, "skipped": 0, "not_found": 0, "details": []}
+    results = {"total": len(leads), "updated": 0, "skipped": 0, "not_found": 0, "details": []}
 
-    for convo in all_convos:
-        messages = convo.get("messages", [])
-        lead_replied = any(m.get("sender") == "CORRESPONDENT" for m in messages)
+    for lead in leads:
+        first_name = lead.get("firstName", "")
+        last_name = lead.get("lastName", "")
+        linkedin_url = lead.get("profileUrl", "")
+        stage_name = lead.get("stage", "replied")
+        target_stage = STAGES.get(stage_name, STAGES["replied"])
 
-        if not lead_replied:
-            continue
-
-        results["replies_found"] += 1
-        profile = convo.get("correspondentProfile", {})
-        first_name = profile.get("firstName", "")
-        last_name = profile.get("lastName", "")
-        linkedin_url = profile.get("profileUrl", "")
-
-        result = process_lead(first_name, last_name, linkedin_url, STAGES["replied"], "SYNC")
+        result = process_lead(first_name, last_name, linkedin_url, target_stage, "SYNC")
         results["details"].append(result)
 
         if result["status"] == "updated":
             results["updated"] += 1
-        elif result["status"] in ("already_at_or_past_stage",):
+        elif result["status"] == "already_at_or_past_stage":
             results["skipped"] += 1
         else:
             results["not_found"] += 1
 
-    logger.info(f"Sync complete: {results['replies_found']} replies, {results['updated']} updated")
+    logger.info(f"Sync complete: {results['updated']} updated, {results['skipped']} skipped, {results['not_found']} not found")
     return jsonify(results)
 
 
