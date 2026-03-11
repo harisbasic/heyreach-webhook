@@ -149,7 +149,7 @@ def attio_create_note(record_id, title, body):
                 "data": {
                     "title": title,
                     "format": "plaintext",
-                    "content": body,
+                    "content_plaintext": body,
                     "parent_object": "people",
                     "parent_record_id": record_id,
                 }
@@ -308,8 +308,13 @@ def sync_conversations():
         linkedin_url = lead.get("profileUrl", "")
         stage_name = lead.get("stage", "replied")
         target_stage = STAGES.get(stage_name, STAGES["replied"])
+        message_text = lead.get("messageText", "")
 
-        result = process_lead(first_name, last_name, linkedin_url, target_stage, "SYNC")
+        try:
+            result = process_lead(first_name, last_name, linkedin_url, target_stage, "SYNC", message_text=message_text)
+        except Exception as e:
+            logger.error(f"Error processing {first_name} {last_name}: {e}")
+            result = {"status": "error", "name": f"{first_name} {last_name}", "error": str(e)}
         results["details"].append(result)
 
         if result["status"] == "updated":
